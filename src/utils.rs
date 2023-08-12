@@ -1,3 +1,5 @@
+use crate::state_manager::StateManager;
+
 pub fn map_range(value: u16, from_range: (u16, u16), to_range: (u16, u16), invert: bool) -> u16 {
     let mut value = value;
     let (from_min, from_max) = from_range;
@@ -30,4 +32,28 @@ pub fn map_range(value: u16, from_range: (u16, u16), to_range: (u16, u16), inver
 
     // Ensure the result is within the u16 range
     result.min(65535) as u16
+}
+
+pub fn mix_joycon_states(state: &StateManager) -> (bool, bool) {
+    let armed = state.l.armed || state.r.armed;
+
+    let mut forward = true;
+    if state.l.armed && state.r.armed {
+        // both are armed, we go whatever diretion they agree on
+        if state.l.forward == state.r.forward {
+            // both agree, we go whatever diretion they agree on
+            forward = state.l.forward;
+        } else {
+            // jesus, they disagree.  just go forward.
+            forward = true;
+        }
+    } else if state.l.armed {
+        // use left joycon (0) to decide direction, it's armed
+        forward = state.l.forward;
+    } else if state.r.armed {
+        // use right joycon (1) to decide direction, it's armed
+        forward = state.r.forward;
+    }
+
+    (forward, armed)
 }

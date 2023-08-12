@@ -1,6 +1,6 @@
 use crate::utils::map_range;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JoyConState {
     pub forward: bool,
     pub armed: bool,

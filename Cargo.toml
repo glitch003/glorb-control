@@ -11,6 +11,7 @@ car = []
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+arc-swap = "1.6.0"
 arraydeque = { version = "~0.4", default-features = false }
 joycon-rs = "0.6.3"
 serialport = "4.2.2"

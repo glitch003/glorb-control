@@ -1,5 +1,9 @@
-use std::{sync::mpsc, thread};
+use std::{
+    sync::{mpsc, Arc, Mutex},
+    thread,
+};
 
+use arc_swap::ArcSwap;
 use joycon_rs::prelude::*;
 
 // mod sbus_parser;
@@ -13,22 +17,24 @@ use car::Car;
 use car::CarCommand;
 
 mod utils;
+use utils::mix_joycon_states;
 
 mod joycons;
-use joycons::remap_left_joycon;
+use joycons::{remap_left_joycon, remap_right_joycon};
 
-use crate::joycons::JoyConState;
+mod state_manager;
+use state_manager::StateManager;
 
 fn main() {
     // Create a channel for sending commands
-    let (tx, rx) = mpsc::channel();
+    let (car_tx, car_rx) = mpsc::channel();
 
     //  Spawn a dedicated thread that owns `car`
-    let _handle = thread::spawn(move || {
+    let _car_handle = thread::spawn(move || {
         #[cfg(feature = "car")]
         let mut car = Car::new();
-        for command in rx {
-            // println!("Sending command to car: {:?}", command);
+        for command in car_rx {
+            println!("Sending command to car: {:?}", command);
             match command {
                 CarCommand::SendData(horizontal_mapped, vertical_mapped, forward, armed) => {
                     #[cfg(feature = "car")]
@@ -47,102 +53,138 @@ fn main() {
         }
     };
 
+    let state_store = Arc::new(ArcSwap::from(Arc::new(StateManager::new())));
+
     managed_devices
         .into_iter()
         .chain(new_devices)
         .flat_map(|dev| SimpleJoyConDriver::new(&dev))
         .try_for_each::<_, JoyConResult<()>>(|driver| {
-            println!("Found JoyCon: {:?}", driver.joycon().device_type());
+            let device_type = driver.joycon().device_type();
 
-            let tx_clone = tx.clone();
+            println!("Found JoyCon: {:?}", device_type);
+
+            let car_tx_clone = car_tx.clone();
+            let state_store = state_store.clone();
 
             // Change JoyCon to Simple hid mode.
             // let simple_hid_mode = SimpleHIDMode::new(driver)?;
             let standard_full_mode = StandardFullMode::new(driver)?;
 
+            let device_type = Arc::new(device_type);
+
             // Spawn thread
             thread::spawn(move || {
-                let mut joycon_states = vec![
-                    JoyConState {
-                        forward: true,
-                        armed: false,
-                    },
-                    JoyConState {
-                        forward: true,
-                        armed: false,
-                    },
-                ];
-
                 loop {
                     // Forward the report to the car thread
                     let report = standard_full_mode.read_input_report();
+
                     match report {
                         Ok(report) => {
                             // println!("{:?}", report);
-                            // let horizontal = report.common.left_analog_stick_data.horizontal;
+                            let state_arc = state_store.load_full();
+                            let mut state = (*state_arc).clone();
 
-                            let (horizontal_mapped, vertical_mapped) = remap_left_joycon(
-                                report.common.left_analog_stick_data.horizontal,
-                                report.common.left_analog_stick_data.vertical,
-                            );
-                            // println!(
-                            //     "unmapped\tHorizontal: {}\tVertical: {}",
-                            //     report.common.right_analog_stick_data.horizontal,
-                            //     report.common.right_analog_stick_data.vertical
-                            // );
+                            match *device_type {
+                                JoyConDeviceType::JoyConL => {
+                                    // left joycon buttons
 
-                            // left joycon buttons
-                            if report.common.pushed_buttons.contains(Buttons::Down) {
-                                println!("Down pressed");
-                                joycon_states[0].forward = false;
-                            } else if report.common.pushed_buttons.contains(Buttons::Up) {
-                                println!("Down pressed");
-                                joycon_states[0].forward = true;
-                            } else if report.common.pushed_buttons.contains(Buttons::Left)
-                                && report.common.pushed_buttons.contains(Buttons::Right)
-                            {
-                                println!("Left and right pressed - armed");
-                                joycon_states[0].armed = true;
-                            } else if report.common.pushed_buttons.contains(Buttons::SL)
-                                && report.common.pushed_buttons.contains(Buttons::SR)
-                            {
-                                println!("L and R pressed - unarmed");
-                                joycon_states[0].armed = false;
-                            }
+                                    if report.common.pushed_buttons.contains(Buttons::Down) {
+                                        println!("Down pressed");
+                                        state.l.forward = false;
+                                    } else if report.common.pushed_buttons.contains(Buttons::Up) {
+                                        println!("Up pressed");
+                                        state.l.forward = true;
+                                    } else if report.common.pushed_buttons.contains(Buttons::Left)
+                                        && report.common.pushed_buttons.contains(Buttons::Right)
+                                    {
+                                        println!("Left and right pressed - armed");
+                                        state.l.armed = true;
+                                    } else if report.common.pushed_buttons.contains(Buttons::SL)
+                                        && report.common.pushed_buttons.contains(Buttons::SR)
+                                    {
+                                        println!("L and R pressed - unarmed");
+                                        state.l.armed = false;
+                                    }
 
-                            let armed = joycon_states[0].armed || joycon_states[1].armed;
+                                    let (forward, armed) = mix_joycon_states(&state);
 
-                            let mut forward = true;
-                            if joycon_states[0].armed && joycon_states[1].armed {
-                                // both are armed, we go whatever diretion they agree on
-                                if joycon_states[0].forward == joycon_states[1].forward {
-                                    // both agree, we go whatever diretion they agree on
-                                    forward = joycon_states[0].forward;
-                                } else {
-                                    // jesus, they disagree.  just go forward.
-                                    forward = true;
+                                    let (horizontal_mapped, vertical_mapped) = remap_left_joycon(
+                                        report.common.left_analog_stick_data.horizontal,
+                                        report.common.left_analog_stick_data.vertical,
+                                    );
+
+                                    if state.l.armed && !state.r.armed {
+                                        car_tx_clone
+                                            .send(CarCommand::SendData(
+                                                horizontal_mapped,
+                                                vertical_mapped,
+                                                forward,
+                                                armed,
+                                            ))
+                                            .unwrap();
+                                    }
+
+                                    state.set_state(
+                                        (*device_type).clone(),
+                                        state.l.forward,
+                                        state.l.armed,
+                                    );
                                 }
-                            } else if joycon_states[0].armed {
-                                // use left joycon (0) to decide direction, it's armed
-                                forward = joycon_states[0].forward;
-                            } else if joycon_states[1].armed {
-                                // use right joycon (1) to decide direction, it's armed
-                                forward = joycon_states[1].forward;
-                            }
+                                JoyConDeviceType::JoyConR => {
+                                    // right joycon buttons
+                                    if report.common.pushed_buttons.contains(Buttons::B) {
+                                        println!("B pressed");
+                                        state.r.forward = false;
+                                    } else if report.common.pushed_buttons.contains(Buttons::X) {
+                                        println!("X pressed");
+                                        state.r.forward = true;
+                                    } else if report.common.pushed_buttons.contains(Buttons::Y)
+                                        && report.common.pushed_buttons.contains(Buttons::A)
+                                    {
+                                        println!("Y and A pressed - armed");
+                                        state.r.armed = true;
+                                    } else if report.common.pushed_buttons.contains(Buttons::SL)
+                                        && report.common.pushed_buttons.contains(Buttons::SR)
+                                    {
+                                        println!("L and R pressed - unarmed");
+                                        state.r.armed = false;
+                                    }
 
-                            println!(
-                                "Horizontal: {}\t Vertical: {}\t forward: {}\t armed: {}\t joycon_states: {:?}",
-                                horizontal_mapped, vertical_mapped, forward, armed, joycon_states
-                            );
+                                    let (horizontal_mapped, vertical_mapped) = remap_right_joycon(
+                                        report.common.right_analog_stick_data.horizontal,
+                                        report.common.right_analog_stick_data.vertical,
+                                    );
 
-                            tx_clone
-                                .send(CarCommand::SendData(
-                                    horizontal_mapped,
-                                    vertical_mapped,
-                                    forward,
-                                    armed,
-                                ))
-                                .unwrap();
+                                    // println!(
+                                    //     "Left joycon sending Horizontal: {}\t Vertical: {}\t forward: {}\t armed: {}\t joycon_states: {:?}",
+                                    //     horizontal_mapped, vertical_mapped, forward, armed, state
+                                    // );
+                                    let (forward, armed) = mix_joycon_states(&state);
+
+                                    if state.r.armed && !state.l.armed {
+                                        car_tx_clone
+                                            .send(CarCommand::SendData(
+                                                horizontal_mapped,
+                                                vertical_mapped,
+                                                forward,
+                                                armed,
+                                            ))
+                                            .unwrap();
+                                    }
+
+                                    state.set_state(
+                                        (*device_type).clone(),
+                                        state.r.forward,
+                                        state.r.armed,
+                                    );
+                                }
+                                _ => {
+                                    println!("Unknown JoyCon type {:?}", device_type)
+                                }
+                            };
+
+                            state_store.store(Arc::new(state));
                         }
                         Err(e) => {
                             println!("Error: {:?}", e);
