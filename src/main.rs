@@ -112,6 +112,7 @@ fn main() {
                                     let (horizontal_mapped, vertical_mapped) = remap_left_joycon(
                                         report.common.left_analog_stick_data.horizontal,
                                         report.common.left_analog_stick_data.vertical,
+                                        state.l.forward,
                                     );
 
                                     if state.l.armed && !state.r.armed {
@@ -154,6 +155,7 @@ fn main() {
                                     let (horizontal_mapped, vertical_mapped) = remap_right_joycon(
                                         report.common.right_analog_stick_data.horizontal,
                                         report.common.right_analog_stick_data.vertical,
+                                        state.r.forward,
                                     );
 
                                     // println!(
