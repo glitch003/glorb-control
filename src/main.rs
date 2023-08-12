@@ -1,138 +1,43 @@
-// extern crate hidapi;
-extern crate serialport;
+use std::{sync::mpsc, thread};
 
-use std::io::Write;
-use std::time::Duration;
+use joycon_rs::prelude::*;
 
-mod sbus_parser;
-use joycon_rs::prelude::input_report_mode::PushedButtons;
-use sbus_parser::SBusPacketParser;
+// mod sbus_parser;
+// use sbus_parser::SBusPacketParser;
 
 mod sbus_writer;
-use sbus_writer::encode_sbus;
 
-// use hidapi::HidApi;
-use joycon_rs::prelude::*;
-use serialport::SerialPort;
+mod car;
+#[cfg(feature = "car")]
+use car::Car;
+use car::CarCommand;
 
-use std::collections::HashMap;
+mod utils;
 
-fn map_range(value: u16, from_range: (u16, u16), to_range: (u16, u16), invert: bool) -> u16 {
-    let mut value = value;
-    let (mut from_min, mut from_max) = from_range;
-    let (mut to_min, mut to_max) = to_range;
+mod joycons;
+use joycons::remap_left_joycon;
 
-    // If invert flag is set, swap the to_range values
-    if invert {
-        value = from_max + from_min - value;
-    }
-
-    if from_min == from_max {
-        return ((to_min as u32 + to_max as u32) / 2) as u16; // Midpoint of to_range
-    }
-
-    // Ensure the value is within the from_range
-    let value = if value > from_max {
-        from_max
-    } else if value < from_min {
-        from_min
-    } else {
-        value
-    };
-
-    // Linearly interpolate the value between the source range
-    let proportion =
-        (value as u32 - from_min as u32) as f64 / (from_max as u32 - from_min as u32) as f64;
-
-    // Map the proportion to the destination range
-    let result = (to_min as f64 + proportion * (to_max - to_min) as f64).round() as u32;
-
-    // Ensure the result is within the u16 range
-    result.min(65535) as u16
-}
-
-// fn process_report(report: &[u8; 256]) -> HashMap<&'static str, u8> {
-//     let mut result = HashMap::new();
-
-//     result.insert("up", if report[1] < 128 { 128 - report[1] } else { 0 });
-//     result.insert("down", if report[1] > 128 { report[1] - 127 } else { 0 });
-//     result.insert("right", if report[2] < 128 { 128 - report[2] } else { 0 });
-//     result.insert("left", if report[2] > 128 { report[2] - 127 } else { 0 });
-
-//     result
-// }
-
-fn process_report(report: &[u8; 256]) -> HashMap<&'static str, u8> {
-    let mut result = HashMap::new();
-
-    // result.insert("up", if report[8] < 128 { 128 - report[8] } else { 0 });
-    // result.insert("down", if report[8] > 128 { report[8] - 127 } else { 0 });
-    // result.insert("right", if report[7] < 128 { 128 - report[7] } else { 0 });
-    // result.insert("left", if report[7] > 128 { report[7] - 127 } else { 0 });
-
-    result.insert("right/left", report[7]);
-    result.insert("up/down", report[8]);
-
-    result
-}
-
-fn send_data_to_car(
-    horizontal: u16,
-    vertical: u16,
-    forward: bool,
-    armed: bool,
-    serial_port: &mut dyn SerialPort,
-) {
-    let mut channels: [u16; 16] = [1024; 16];
-    channels[0] = horizontal;
-    channels[2] = vertical;
-    channels[6] = 240;
-    channels[7] = 240;
-
-    if forward {
-        channels[5] = 1807;
-    } else {
-        channels[5] = 240;
-    }
-
-    if armed {
-        channels[4] = 1807;
-    } else {
-        channels[4] = 240;
-    }
-
-    let packet = encode_sbus(channels);
-
-    // println!("writing to serial port: {:?}", packet);
-
-    serial_port.write(&packet);
-}
-
-fn remap_left_joycon(horizontal: u16, vertical: u16) -> (u16, u16) {
-    // horizontal min (left) 670
-    // horizotal max (right) 3420
-    let horizontal_mapped = map_range(horizontal, (670, 3240), (240, 1807), true);
-
-    // vertical min (down) 1080
-    // vertical max (up) 3240
-    let vertical_mapped = map_range(vertical, (1080, 3240), (240, 1807), false);
-
-    (horizontal_mapped, vertical_mapped)
-}
-
-fn remap_right_joycon(horizontal: u16, vertical: u16) -> (u16, u16) {
-    // horizontal min (left) 700
-    // horizotal max (right) 3600
-    let horizontal_mapped = map_range(horizontal, (700, 3600), (240, 1807), true);
-
-    // vertical min (down) 780
-    // vertical max (up) 3000
-    let vertical_mapped = map_range(vertical, (780, 3000), (240, 1807), false);
-
-    (horizontal_mapped, vertical_mapped)
-}
+use crate::joycons::JoyConState;
 
 fn main() {
+    // Create a channel for sending commands
+    let (tx, rx) = mpsc::channel();
+
+    //  Spawn a dedicated thread that owns `car`
+    let _handle = thread::spawn(move || {
+        #[cfg(feature = "car")]
+        let mut car = Car::new();
+        for command in rx {
+            // println!("Sending command to car: {:?}", command);
+            match command {
+                CarCommand::SendData(horizontal_mapped, vertical_mapped, forward, armed) => {
+                    #[cfg(feature = "car")]
+                    car.send_data(horizontal_mapped, vertical_mapped, forward, armed);
+                } // Handle other commands as needed
+            }
+        }
+    });
+
     let manager = JoyConManager::get_instance();
     let (managed_devices, new_devices) = {
         let lock = manager.lock();
@@ -149,30 +54,27 @@ fn main() {
         .try_for_each::<_, JoyConResult<()>>(|driver| {
             println!("Found JoyCon: {:?}", driver.joycon().device_type());
 
+            let tx_clone = tx.clone();
+
             // Change JoyCon to Simple hid mode.
             // let simple_hid_mode = SimpleHIDMode::new(driver)?;
             let standard_full_mode = StandardFullMode::new(driver)?;
 
             // Spawn thread
-            std::thread::spawn(move || {
-                let mut forward = true;
-                let mut armed = false;
-                // Define serial port parameters for SBUS
-                let port_name = "/dev/tty.usbserial-ABSCDGUN"; // Adjust according to your OS and connected device
-                let baud_rate = 100_000; // SBUS baud rate
-                let timeout = Duration::from_millis(10);
-                // Open the serial port with SBUS settings
-                let mut port = serialport::new(port_name, baud_rate)
-                    .data_bits(serialport::DataBits::Eight)
-                    .parity(serialport::Parity::Even)
-                    .stop_bits(serialport::StopBits::Two)
-                    .timeout(timeout)
-                    .open()
-                    .expect("Failed to open serial port");
+            thread::spawn(move || {
+                let mut joycon_states = vec![
+                    JoyConState {
+                        forward: true,
+                        armed: false,
+                    },
+                    JoyConState {
+                        forward: true,
+                        armed: false,
+                    },
+                ];
+
                 loop {
-                    // Forward the report to the main thread
-                    // println!("{:?}", simple_hid_mode.read_input_report());
-                    // println!("{:?}", standard_full_mode.read_input_report());
+                    // Forward the report to the car thread
                     let report = standard_full_mode.read_input_report();
                     match report {
                         Ok(report) => {
@@ -188,34 +90,59 @@ fn main() {
                             //     report.common.right_analog_stick_data.horizontal,
                             //     report.common.right_analog_stick_data.vertical
                             // );
-                            println!(
-                                "mapped\tHorizontal: {}\tVertical: {}, forward: {}, armed: {}",
-                                horizontal_mapped, vertical_mapped, forward, armed
-                            );
+
+                            // left joycon buttons
                             if report.common.pushed_buttons.contains(Buttons::Down) {
                                 println!("Down pressed");
-                                forward = false;
+                                joycon_states[0].forward = false;
                             } else if report.common.pushed_buttons.contains(Buttons::Up) {
                                 println!("Down pressed");
-                                forward = true;
+                                joycon_states[0].forward = true;
                             } else if report.common.pushed_buttons.contains(Buttons::Left)
                                 && report.common.pushed_buttons.contains(Buttons::Right)
                             {
                                 println!("Left and right pressed - armed");
-                                armed = true;
+                                joycon_states[0].armed = true;
                             } else if report.common.pushed_buttons.contains(Buttons::SL)
                                 && report.common.pushed_buttons.contains(Buttons::SR)
                             {
                                 println!("L and R pressed - unarmed");
-                                armed = false;
+                                joycon_states[0].armed = false;
                             }
-                            send_data_to_car(
-                                horizontal_mapped,
-                                vertical_mapped,
-                                forward,
-                                armed,
-                                &mut *port,
+
+                            let armed = joycon_states[0].armed || joycon_states[1].armed;
+
+                            let mut forward = true;
+                            if joycon_states[0].armed && joycon_states[1].armed {
+                                // both are armed, we go whatever diretion they agree on
+                                if joycon_states[0].forward == joycon_states[1].forward {
+                                    // both agree, we go whatever diretion they agree on
+                                    forward = joycon_states[0].forward;
+                                } else {
+                                    // jesus, they disagree.  just go forward.
+                                    forward = true;
+                                }
+                            } else if joycon_states[0].armed {
+                                // use left joycon (0) to decide direction, it's armed
+                                forward = joycon_states[0].forward;
+                            } else if joycon_states[1].armed {
+                                // use right joycon (1) to decide direction, it's armed
+                                forward = joycon_states[1].forward;
+                            }
+
+                            println!(
+                                "Horizontal: {}\t Vertical: {}\t forward: {}\t armed: {}\t joycon_states: {:?}",
+                                horizontal_mapped, vertical_mapped, forward, armed, joycon_states
                             );
+
+                            tx_clone
+                                .send(CarCommand::SendData(
+                                    horizontal_mapped,
+                                    vertical_mapped,
+                                    forward,
+                                    armed,
+                                ))
+                                .unwrap();
                         }
                         Err(e) => {
                             println!("Error: {:?}", e);
