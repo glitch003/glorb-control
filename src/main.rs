@@ -17,9 +17,15 @@ use serialport::SerialPort;
 
 use std::collections::HashMap;
 
-fn map_range(value: u16, from_range: (u16, u16), to_range: (u16, u16)) -> u16 {
-    let (from_min, from_max) = from_range;
-    let (to_min, to_max) = to_range;
+fn map_range(value: u16, from_range: (u16, u16), to_range: (u16, u16), invert: bool) -> u16 {
+    let mut value = value;
+    let (mut from_min, mut from_max) = from_range;
+    let (mut to_min, mut to_max) = to_range;
+
+    // If invert flag is set, swap the to_range values
+    if invert {
+        value = from_max + from_min - value;
+    }
 
     if from_min == from_max {
         return ((to_min as u32 + to_max as u32) / 2) as u16; // Midpoint of to_range
@@ -105,11 +111,11 @@ fn send_data_to_car(
 fn remap_left_joycon(horizontal: u16, vertical: u16) -> (u16, u16) {
     // horizontal min (left) 670
     // horizotal max (right) 3420
-    let horizontal_mapped = map_range(horizontal, (670, 3240), (240, 1807));
+    let horizontal_mapped = map_range(horizontal, (670, 3240), (240, 1807), true);
 
     // vertical min (down) 1080
     // vertical max (up) 3240
-    let vertical_mapped = map_range(vertical, (1080, 3240), (240, 1807));
+    let vertical_mapped = map_range(vertical, (1080, 3240), (240, 1807), false);
 
     (horizontal_mapped, vertical_mapped)
 }
@@ -117,11 +123,11 @@ fn remap_left_joycon(horizontal: u16, vertical: u16) -> (u16, u16) {
 fn remap_right_joycon(horizontal: u16, vertical: u16) -> (u16, u16) {
     // horizontal min (left) 700
     // horizotal max (right) 3600
-    let horizontal_mapped = map_range(horizontal, (700, 3600), (240, 1807));
+    let horizontal_mapped = map_range(horizontal, (700, 3600), (240, 1807), true);
 
     // vertical min (down) 780
     // vertical max (up) 3000
-    let vertical_mapped = map_range(vertical, (780, 3000), (240, 1807));
+    let vertical_mapped = map_range(vertical, (780, 3000), (240, 1807), false);
 
     (horizontal_mapped, vertical_mapped)
 }
